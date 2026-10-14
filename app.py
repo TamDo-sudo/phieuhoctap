@@ -3,50 +3,72 @@
 import hashlib
 import hmac
 import math
-import sqlite3
+from contextlib import closing
 from datetime import date, datetime
 
 import pandas as pd
+import psycopg2
 import streamlit as st
+from psycopg2.extras import RealDictCursor
 
 st.set_page_config(page_title="Cổng học tập cá nhân", page_icon="🎓")
 
-# ---------------------------------------------------------------- Cơ sở dữ liệu
-@st.cache_resource
-def get_conn():
-    c = sqlite3.connect("data.db", check_same_thread=False)
-    c.row_factory = sqlite3.Row
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS sv(
-            mssv TEXT PRIMARY KEY, ten TEXT, pin_hash TEXT);
-        CREATE TABLE IF NOT EXISTS diem(
-            mssv TEXT, ky TEXT, mon TEXT, tc INTEGER, diem REAL, ngay TEXT,
-            PRIMARY KEY (mssv, ky, mon));
-        CREATE TABLE IF NOT EXISTS mon_hoc(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, mssv TEXT, ten TEXT,
-            tc INTEGER, mt REAL, han TEXT, pct INTEGER DEFAULT 0);
-        """
-    )
-    c.commit()
-    return c
-
-
-def query(sql, params=()):
-    return get_conn().execute(sql, params).fetchall()
-
-
-def run(sql, params=()):
-    c = get_conn()
-    c.execute(sql, params)
-    c.commit()
-
-
+# ---------------------------------------------------------------- Cơ sở dữ liệu (Supabase / PostgreSQL)
 def secret(key, default=""):
     try:
         return st.secrets[key]
     except Exception:
         return default
+
+
+def connect():
+    return psycopg2.connect(secret("DATABASE_URL"), connect_timeout=15)
+
+
+def query(sql, params=()):
+    with closing(connect()) as c, c.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql.replace("?", "%s"), params)
+        return cur.fetchall()
+
+
+def run(sql, params=()):
+    with closing(connect()) as c:
+        with c, c.cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params)
+
+
+SQL_DIEM = """INSERT INTO diem (mssv, ky, mon, tc, diem, ngay) VALUES (%s,%s,%s,%s,%s,%s)
+ON CONFLICT (mssv, ky, mon) DO UPDATE
+SET tc=EXCLUDED.tc, diem=EXCLUDED.diem, ngay=EXCLUDED.ngay"""
+
+
+def luu_diem(rows):
+    with closing(connect()) as c:
+        with c, c.cursor() as cur:
+            cur.executemany(SQL_DIEM, rows)
+
+
+@st.cache_resource
+def init_db():
+    with closing(connect()) as c:
+        with c, c.cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS sv(mssv TEXT PRIMARY KEY, ten TEXT, pin_hash TEXT)")
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS diem(
+                mssv TEXT, ky TEXT, mon TEXT, tc INTEGER, diem DOUBLE PRECISION, ngay TEXT,
+                PRIMARY KEY (mssv, ky, mon))"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS mon_hoc(
+                id SERIAL PRIMARY KEY, mssv TEXT, ten TEXT, tc INTEGER,
+                mt DOUBLE PRECISION, han TEXT, pct INTEGER DEFAULT 0)"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS khao_sat(
+                id SERIAL PRIMARY KEY, thoi_gian TEXT, ten TEXT, mssv TEXT,
+                mon TEXT, diem DOUBLE PRECISION)"""
+            )
+    return True
 
 
 def hash_pin(mssv, pin):
@@ -129,9 +151,8 @@ def teacher_screen():
             diem = c2.number_input("Điểm (0–10)", 0.0, 10.0, 8.0, 0.1)
             if st.form_submit_button("Lưu điểm"):
                 if mon.strip():
-                    run("INSERT OR REPLACE INTO diem VALUES (?,?,?,?,?,?)",
-                        (pick, ky.strip() or "Khác", mon.strip(), int(tc), float(diem),
-                         datetime.now().strftime("%d/%m/%Y")))
+                    luu_diem([(pick, ky.strip() or "Khác", mon.strip(), int(tc), float(diem),
+                               datetime.now().strftime("%d/%m/%Y"))])
                     st.success("Đã lưu.")
                 else:
                     st.error("Nhập tên môn học.")
@@ -140,7 +161,7 @@ def teacher_screen():
 
     st.divider()
     st.subheader("Nhập nhiều điểm bằng file CSV / sao lưu")
-    st.caption("Cột bắt buộc: mssv, ky, mon, tc, diem. Dùng cả để khôi phục dữ liệu sau khi app khởi động lại.")
+    st.caption("Cột bắt buộc: mssv, ky, mon, tc, diem. Dùng để nhập hàng loạt hoặc khôi phục dữ liệu.")
     up = st.file_uploader("Chọn file CSV", type="csv")
     if up and st.button("Nhập file"):
         df = pd.read_csv(up)
@@ -148,10 +169,8 @@ def teacher_screen():
         if not need.issubset(df.columns):
             st.error("Thiếu cột: " + ", ".join(sorted(need - set(df.columns))))
         else:
-            for _, r in df.iterrows():
-                run("INSERT OR REPLACE INTO diem VALUES (?,?,?,?,?,?)",
-                    (str(r.mssv), str(r.ky), str(r.mon), int(r.tc), float(r.diem),
-                     datetime.now().strftime("%d/%m/%Y")))
+            luu_diem([(str(r.mssv), str(r.ky), str(r.mon), int(r.tc), float(r.diem),
+                       datetime.now().strftime("%d/%m/%Y")) for _, r in df.iterrows()])
             st.success(f"Đã nhập {len(df)} dòng.")
     allrows = query("SELECT mssv, ky, mon, tc, diem FROM diem")
     if allrows:
@@ -198,7 +217,7 @@ def progress_tab(mssv):
             st.rerun()
 
     overall = st.container()
-    rows = query("SELECT * FROM mon_hoc WHERE mssv=?", (mssv,))
+    rows = query("SELECT * FROM mon_hoc WHERE mssv=? ORDER BY id", (mssv,))
     if not rows:
         st.info("Chưa có môn nào. Hãy thêm môn ở trên.")
         return
@@ -248,7 +267,58 @@ def advice_tab(mssv):
     st.caption("Mẹo: học theo phiên 25–45 phút, nghỉ 5–10 phút, cập nhật tiến độ cuối ngày.")
 
 
+# ---------------------------------------------------------------- Khảo sát điểm số
+def survey_screen():
+    st.title("📝 Khảo sát điểm số")
+    st.write("Vui lòng điền thông tin bên dưới.")
+    with st.form("f_khao_sat", clear_on_submit=True):
+        ten = st.text_input("Họ và tên")
+        mssv = st.text_input("MSSV (không bắt buộc)")
+        mon = st.text_input("Môn học")
+        diem = st.number_input("Điểm (thang 10)", 0.0, 10.0, 0.0, 0.1)
+        gui = st.form_submit_button("Gửi", type="primary")
+    if gui:
+        if not ten.strip() or not mon.strip():
+            st.error("⚠️ Vui lòng nhập đầy đủ Họ tên và Môn học.")
+        else:
+            run("INSERT INTO khao_sat(thoi_gian, ten, mssv, mon, diem) VALUES (?,?,?,?,?)",
+                (datetime.now().strftime("%d/%m/%Y %H:%M:%S"), ten.strip(), mssv.strip(),
+                 mon.strip(), float(diem)))
+            st.success("✅ Đã ghi nhận điểm của bạn. Cảm ơn!")
+
+
+def survey_results():
+    st.subheader("Kết quả khảo sát điểm số")
+    rows = query("SELECT thoi_gian, ten, mssv, mon, diem FROM khao_sat ORDER BY id DESC")
+    if not rows:
+        st.info("Chưa có phản hồi nào.")
+        return
+    df = pd.DataFrame([dict(r) for r in rows])
+    c1, c2 = st.columns(2)
+    c1.metric("Số phản hồi", len(df))
+    c2.metric("Điểm trung bình chung", f"{df['diem'].mean():.2f}")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.caption("Điểm trung bình theo môn")
+    st.bar_chart(df.groupby("mon")["diem"].mean())
+    st.download_button("⬇ Tải kết quả khảo sát (CSV)", df.to_csv(index=False).encode("utf-8-sig"),
+                       "khao-sat.csv", "text/csv")
+
+
 # ---------------------------------------------------------------- Chạy chính
+if not secret("DATABASE_URL"):
+    st.error("Chưa đặt DATABASE_URL trong Secrets. Xem hướng dẫn nối Supabase.")
+    st.stop()
+try:
+    init_db()
+except Exception as e:
+    st.error("Không kết nối được cơ sở dữ liệu. Kiểm tra lại DATABASE_URL trong Secrets.")
+    st.caption(f"Chi tiết: {type(e).__name__}")
+    st.stop()
+
+if st.query_params.get("trang") == "khao-sat":
+    survey_screen()
+    st.stop()
+
 user = st.session_state.get("user")
 if not user:
     login_screen()
@@ -260,6 +330,8 @@ else:
         st.rerun()
     if user["role"] == "gv":
         teacher_screen()
+        st.divider()
+        survey_results()
     else:
         st.caption(f"Xin chào {user['ten']} ({user['mssv']})")
         a, b, c = st.tabs(["Điểm của tôi", "Tiến độ", "Gợi ý học tập"])
